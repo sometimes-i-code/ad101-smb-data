@@ -20,6 +20,39 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ── PASSWORD GATE ─────────────────────────────────────────────────────────────
+def check_password():
+    """Returns True if the user has entered the correct password."""
+    if st.session_state.get("authenticated"):
+        return True
+
+    # Try to get password from Streamlit secrets
+    try:
+        correct_password = st.secrets["password"]
+    except Exception:
+        # No secret set -- block access with a clear message
+        st.error("No password configured. Add a `password` secret in Streamlit Cloud settings.")
+        st.stop()
+
+    # Center the login form
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.markdown("## ad101")
+        st.markdown("**Research Explorer** — Internal access only")
+        st.markdown("<br>", unsafe_allow_html=True)
+        entered = st.text_input("Password", type="password", placeholder="Enter password...")
+        if st.button("Enter", type="primary", use_container_width=True):
+            if entered == correct_password:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    return False
+
+if not check_password():
+    st.stop()
+
 # ── PALETTE ──────────────────────────────────────────────────────────────────
 BLK = "#111111"; RED = "#B85042"; GY = "#888888"; LGY = "#DDDDDD"
 GN  = "#1A3320"; GL  = "#4ADE80"; GOLD = "#C8A84B"
