@@ -1,6 +1,6 @@
 """
-ad101 Survey Data Explorer
-Combines v5 (general SMB) and v8 (online/hybrid) Pollfish survey data.
+ad101 Survey + Research Explorer
+All data sources in one place. API used only when you click Generate.
 """
 
 import streamlit as st
@@ -9,614 +9,821 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import io, os
+import matplotlib.patches as mpatches
+import io, os, re, json
 from datetime import datetime
 
-st.set_page_config(page_title="ad101 Survey Explorer", page_icon="📊",
-                   layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="ad101 Research Explorer",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-INDIGO="#5046E5"; INDIGO_L="#8B82F0"; GRAY="#9CA3AF"
-GREEN="#10B981"; RED="#EF4444"; AMBER="#F59E0B"; DARK="#1E1B4B"
+# ── PALETTE ──────────────────────────────────────────────────────────────────
+BLK = "#111111"; RED = "#B85042"; GY = "#888888"; LGY = "#DDDDDD"
+GN  = "#1A3320"; GL  = "#4ADE80"; GOLD = "#C8A84B"
+W   = "#FFFFFF"; BG  = "#F8F7F4"
 
-# ── PASSWORD ─────────────────────────────────────────────────────────────────
-def check_password():
-    if st.session_state.get("auth"): return True
-    try:
-        pwd = st.secrets["password"]
-    except Exception:
-        st.session_state["auth"] = True; return True
-    st.markdown("## ad101 Survey Explorer")
-    entered = st.text_input("Password", type="password")
-    if st.button("Enter"):
-        if entered == pwd: st.session_state["auth"] = True; st.rerun()
-        else: st.error("Incorrect password.")
-    return False
+# ── STYLES ───────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+html, body, [class*="css"] { font-family: 'Calibri', sans-serif; }
+h1 { color: #111111; font-size: 1.8rem; font-weight: 800; }
+h2 { color: #111111; font-size: 1.2rem; font-weight: 700; border-bottom: 2px solid #DDDDDD; padding-bottom: 6px; }
+h3 { color: #333333; font-size: 1rem; font-weight: 700; }
+.stat-box {
+    background: #FFFFFF; border: 1px solid #DDDDDD; border-radius: 8px;
+    padding: 16px 20px; text-align: center; margin-bottom: 8px;
+}
+.stat-number { font-size: 2.4rem; font-weight: 900; color: #B85042; font-family: Arial Black, sans-serif; }
+.stat-label  { font-size: 0.82rem; color: #888888; margin-top: 2px; }
+.ratio-box   { font-size: 1.8rem; font-weight: 900; color: #111111; font-family: Arial Black, sans-serif; }
+.quote-card {
+    background: #FFFFFF; border-left: 3px solid #B85042;
+    padding: 12px 16px; margin: 8px 0; border-radius: 0 6px 6px 0;
+    font-size: 0.9rem; color: #333333;
+}
+.quote-source { font-size: 0.75rem; color: #888888; margin-top: 6px; font-style: italic; }
+.tag-pill {
+    display: inline-block; background: #F0F0F0; color: #555555;
+    border-radius: 12px; padding: 2px 10px; font-size: 0.75rem;
+    margin: 2px; cursor: pointer;
+}
+.section-chip {
+    display: inline-block; background: #1A3320; color: #4ADE80;
+    border-radius: 4px; padding: 2px 10px; font-size: 0.72rem;
+    font-weight: 700; letter-spacing: 1.5px; margin-bottom: 12px;
+}
+div[data-testid="stMetricValue"] { font-size: 2rem; font-weight: 800; color: #B85042; }
+.stTabs [data-baseweb="tab"] { font-size: 0.9rem; font-weight: 600; }
+</style>
+""", unsafe_allow_html=True)
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-def sel(df, col):
-    if col not in df.columns: return pd.Series(0, index=df.index)
-    return (df[col] == "Selected").astype(int)
-
-def vcpct(df, col):
-    return (df[col].value_counts(normalize=True)*100).round(1).to_dict()
-
-def mpct(df, prefix):
-    cols = [c for c in df.columns if c.startswith(prefix)]
-    n = max(len(df), 1)
-    return {c.replace(prefix,"").replace("_"," "): round(df[c].sum()/n*100,1) for c in cols}
-
-# ── NORMALIZATION ─────────────────────────────────────────────────────────────
-def normalize_v5(df):
-    o = pd.DataFrame(index=df.index)
-    o["survey"]       = "v5 — General SMB"
-    o["respondent_id"]= df.get("ID", pd.RangeIndex(len(df))).astype(str)+"_v5"
-    o["age"]          = pd.to_numeric(df["Age"], errors="coerce")
-    o["gender"]       = df["Gender"]
-    o["region"]       = df["US Region"]
-    o["state"]        = df.get("US State", np.nan)
-    o["industry_demo"]= np.nan
-    o["industry"]     = df["Q1: What industry is your business in?"]
-    o["tenure"]       = df["Q2: How long have you been running your business?"]
-    o["operation"]    = df["Q3: How does your business primarily operate?"]
-    o["revenue"]      = df["Q4: Roughly what was your business's annual revenue last year?"]
-    o["gut_reaction"] = df["Q5: When you think about advertising your business, what's your gut reaction?"]
-    o["ad_status"]    = df["Q6: Which best describes where you are with advertising right now?"]
-    o["time_spent"]   = df["Q7: How much time do you realistically spend on marketing and advertising per week?"]
-    o["budget"]       = df["Q9: How much do you currently spend on advertising per month, or if you haven't advertised yet, what would you be comfortable spending?"]
-    o["free_tool"]    = df["Q11: Have you ever used a free tool, quiz, or resource to help with your marketing or advertising?"]
-    o["involvement"]  = df["Q13: If someone was running your ads for you, how involved would you want to be day to day?"]
-    o["ai_attitude"]  = df["Q15: How do you feel about using AI tools to help with your business marketing?"]
-    o["nature_affects"]= np.nan
-    o["success_def"]  = np.nan
-
-    P8 = "Q8: What feels like the hardest part of advertising for your business? Pick your top two._"
-    o["hard_knowing_where"]  = sel(df, P8+"Knowing where to advertise")
-    o["hard_who_to_reach"]   = sel(df, P8+"Figuring out who to reach")
-    o["hard_how_much"]       = sel(df, P8+"Deciding how much to spend")
-    o["hard_creating_ads"]   = sel(df, P8+"Creating the actual ads")
-    o["hard_finding_time"]   = sel(df, P8+"Finding the time to manage it")
-    o["hard_understanding"]  = sel(df, P8+"Understanding whether it's working")
-    o["hard_trusting_advice"]= sel(df, P8+"Trusting that the advice I'm getting is actually right")
-
-    P10 = "Q10: If you had a clear advertising plan built specifically for your business, what would you most want help with after that? Pick your top two._"
-    o["help_running_ads"]    = sel(df, P10+"Actually running the ads. I'd want someone to handle it.")
-    o["help_content_visuals"]= sel(df, P10+"Creating the content and visuals for the ads")
-    o["help_social_media"]   = sel(df, P10+"Managing my social media")
-    o["help_email"]          = sel(df, P10+"Setting up and managing email marketing")
-    o["help_measuring"]      = sel(df, P10+"Figuring out whether it's working and what to change")
-    o["help_try_myself"]     = sel(df, P10+"I'd want to try it myself first before getting help.")
-    o["help_nothing"]        = sel(df, P10+"Nothing. I'd handle everything on my own.")
-
-    P14 = "Q14: If you were paying a service to run your ads, what would worry you most? Pick your top two._"
-    o["worry_wasting_money"] = sel(df, P14+"Wasting money on ads that don't work")
-    o["worry_unexpected"]    = sel(df, P14+"Unexpected charges or fees")
-    o["worry_brand_fit"]     = sel(df, P14+"Ads that don't look or sound like my business")
-    o["worry_not_knowing"]   = sel(df, P14+"Not knowing what's actually being done with my money")
-    o["worry_cant_pause"]    = sel(df, P14+"Not being able to pause or stop quickly if needed")
-    o["worry_bad_reports"]   = sel(df, P14+"Getting reports that don't tell me if it's actually working")
-
-    P16 = "Q16: Which online tools or channels do you currently use for marketing or advertising? Select all that apply._"
-    o["ch_fb_organic"] = sel(df, P16+"Facebook or Instagram (organic posts)")
-    o["ch_fb_ads"]     = sel(df, P16+"Facebook or Instagram ads")
-    o["ch_google_ads"] = sel(df, P16+"Google Ads")
-    o["ch_email"]      = sel(df, P16+"Email marketing (Mailchimp, Klaviyo, etc.)")
-    o["ch_tiktok"]     = sel(df, P16+"TikTok")
-    o["ch_yelp_gbp"]   = sel(df, P16+"Yelp or Google Business Profile")
-    o["ch_ai_tool"]    = sel(df, P16+"ChatGPT or another AI tool")
-    o["ch_no_online"]  = sel(df, P16+"I don't use any online marketing currently.")
-
-    P18 = "Q18: Where do you typically go when looking for business or marketing advice? Select all that apply._"
-    o["adv_google"]   = sel(df, P18+"Google search")
-    o["adv_youtube"]  = sel(df, P18+"YouTube")
-    o["adv_social"]   = sel(df, P18+"Instagram or TikTok")
-    o["adv_reddit"]   = sel(df, P18+"Reddit")
-    o["adv_fb_groups"]= sel(df, P18+"Facebook groups or online communities")
-    o["adv_linkedin"] = sel(df, P18+"LinkedIn")
-    o["adv_ai"]       = sel(df, P18+"AI (Claude, ChatGPT, Gemini, etc)")
-    o["adv_peers"]    = sel(df, P18+"Other business owners I know ")
-    o["adv_dont_look"]= sel(df, P18+"I don't really look for this kind of advice.")
-
-    jarg_map = {"Target Audience":"jarg_target","Paid media":"jarg_paid",
-                "Organic reach":"jarg_organic","Programmatic advertising":"jarg_programmatic",
-                "Channel strategy":"jarg_channel"}
-    jval = {"Extremely familiar":3,"Kind of familiar":2,"I have a rough idea":2,"I'm not sure":1,"Never heard of it":0}
-    for col in [c for c in df.columns if "Q12:" in c and "::" in c]:
-        term = col.split("::")[-1].strip().rstrip(":")
-        key = jarg_map.get(term)
-        if key: o[key] = df[col].map(jval)
-
-    o["open_ended"] = df.get("Q19: In your own words, what would make advertising feel less overwhelming for you? (This answer is very important, however, if you do not wish to respond, type N/A)", np.nan)
-    o["tried_channels_raw"] = np.nan
-    return o
-
-
-def normalize_v8(df):
-    o = pd.DataFrame(index=df.index)
-    o["survey"]       = "v8 — Online/Hybrid"
-    o["respondent_id"]= df.get("ID", pd.RangeIndex(len(df))).astype(str)+"_v8"
-    o["age"]          = pd.to_numeric(df["Age"], errors="coerce")
-    o["gender"]       = df["Gender"]
-    o["region"]       = df["US Region"]
-    o["state"]        = df.get("US State", np.nan)
-    o["industry_demo"]= df.get("Industry Work In", np.nan)
-    o["industry"]     = df["Q1: What industry is your business in?"]
-    o["tenure"]       = df["Q2: How long have you been running your business?"]
-    o["operation"]    = df["SQ3: How does your business primarily operate?"]
-    o["revenue"]      = df["Q3: Roughly what was your business's annual revenue last year?"]
-    o["gut_reaction"] = df["Q4: When you think about advertising your business, what's your gut reaction?"]
-    o["ad_status"]    = df["Q5: Which best describes where you are with advertising right now?"]
-    o["time_spent"]   = df["Q8: How much time do you realistically spend on marketing and advertising per week?"]
-    o["budget"]       = df["Q10: How much do you currently spend on advertising per month, or if you haven't advertised yet, what would you be comfortable spending?"]
-    o["free_tool"]    = df["Q12: Have you ever used a free tool, quiz, or resource to help with your marketing or advertising?"]
-    o["involvement"]  = df["Q15: If someone was running your ads for you, how involved would you want to be day to day?"]
-    o["ai_attitude"]  = df["Q17: How do you feel about using AI tools to help with your business marketing?"]
-    o["nature_affects"]= df["Q13: Does the nature of your business affect how you think about advertising?"]
-
-    q7_cols = [c for c in df.columns if c.startswith("Q7:") and "_" in c and "_oe" not in c]
-    o["success_def"] = df.apply(lambda row: ", ".join(
-        [c.split("_")[-1].strip() for c in q7_cols if str(row.get(c,""))=="Selected"]
-    ) or np.nan, axis=1)
-
-    P9 = "Q9: What feels like the hardest part of advertising for your business? Pick your top two._"
-    o["hard_knowing_where"]  = sel(df, P9+"Knowing where to advertise")
-    o["hard_who_to_reach"]   = sel(df, P9+"Figuring out who to reach")
-    o["hard_how_much"]       = sel(df, P9+"Deciding how much to spend")
-    o["hard_creating_ads"]   = sel(df, P9+"Creating the actual ads")
-    o["hard_finding_time"]   = sel(df, P9+"Finding the time to manage it")
-    o["hard_understanding"]  = sel(df, P9+"Understanding whether it's working")
-    o["hard_trusting_advice"]= sel(df, P9+"Trusting that the advice I'm getting is actually right")
-
-    P11 = "Q11: If you had a clear advertising plan built specifically for your business, what would you most want help with after that? Pick your top two._"
-    o["help_running_ads"]    = sel(df, P11+"Actually running the ads. I'd want someone to handle it.")
-    o["help_content_visuals"]= sel(df, P11+"Creating the content and visuals for the ads")
-    o["help_social_media"]   = sel(df, P11+"Managing my social media")
-    o["help_email"]          = sel(df, P11+"Setting up and managing email marketing")
-    o["help_measuring"]      = sel(df, P11+"Figuring out whether it's working and what to change")
-    o["help_try_myself"]     = sel(df, P11+"I'd want to try it myself first before getting help.")
-    o["help_nothing"]        = sel(df, P11+"Nothing. I'd handle everything on my own.")
-
-    P16 = "Q16: If you were paying a service to run your ads, what would worry you most? Pick your top two._"
-    o["worry_wasting_money"] = sel(df, P16+"Wasting money on ads that don't work")
-    o["worry_unexpected"]    = sel(df, P16+"Unexpected charges or fees")
-    o["worry_brand_fit"]     = sel(df, P16+"Ads that don't look or sound like my business")
-    o["worry_not_knowing"]   = sel(df, P16+"Not knowing what's actually being done with my money")
-    o["worry_cant_pause"]    = sel(df, P16+"Not being able to pause or stop quickly if needed")
-    o["worry_bad_reports"]   = sel(df, P16+"Getting reports that don't tell me if it's actually working")
-
-    P18 = "Q18: Which online tools or channels do you CURRENTLY use for marketing or advertising? Select all that apply._"
-    o["ch_fb_organic"] = sel(df, P18+"Facebook or Instagram (organic posts)")
-    o["ch_fb_ads"]     = sel(df, P18+"Facebook or Instagram ads")
-    o["ch_google_ads"] = sel(df, P18+"Google Ads")
-    o["ch_email"]      = sel(df, P18+"Email marketing (Mailchimp, Klaviyo, etc.)")
-    o["ch_tiktok"]     = sel(df, P18+"TikTok")
-    o["ch_yelp_gbp"]   = sel(df, P18+"Yelp or Google Business Profile")
-    o["ch_ai_tool"]    = pd.Series(0, index=df.index)
-    o["ch_no_online"]  = sel(df, P18+"I don't use any online marketing currently.")
-
-    P19 = "Q19: Where do you typically go when looking for business or marketing advice? Select all that apply._"
-    o["adv_google"]   = sel(df, P19+"Google search")
-    o["adv_youtube"]  = sel(df, P19+"YouTube")
-    o["adv_social"]   = sel(df, P19+"Instagram or TikTok")
-    o["adv_reddit"]   = sel(df, P19+"Reddit")
-    o["adv_fb_groups"]= sel(df, P19+"Facebook groups or online communities")
-    o["adv_linkedin"] = sel(df, P19+"LinkedIn")
-    o["adv_ai"]       = sel(df, P19+"AI (Claude, ChatGPT, Gemini, etc)")
-    o["adv_peers"]    = sel(df, P19+"Other business owners I know")
-    o["adv_dont_look"]= sel(df, P19+"I don't really look for this kind of advice.")
-
-    jarg_map = {"Target Audience":"jarg_target","Paid media":"jarg_paid",
-                "Organic reach":"jarg_organic","Programmatic advertising":"jarg_programmatic",
-                "Channel strategy":"jarg_channel"}
-    jval = {"Extremely familiar":3,"Kind of familiar":2,"I have a rough idea":2,"I'm not sure":1,"Never heard of it":0}
-    for col in [c for c in df.columns if "Q14:" in c and "::" in c]:
-        term = col.split("::")[-1].strip().rstrip(":")
-        key = jarg_map.get(term)
-        if key: o[key] = df[col].map(jval)
-
-    q6_cols = [c for c in df.columns if c.startswith("Q6:") and "_" in c and "_oe" not in c]
-    o["tried_channels_raw"] = df.apply(lambda row: ", ".join(
-        [c.split("_")[-1].strip() for c in q6_cols if str(row.get(c,""))=="Selected"]
-    ) or np.nan, axis=1)
-
-    q20_cols = [c for c in df.columns if c.startswith("Q20:")]
-    o["open_ended"] = df[q20_cols[0]] if q20_cols else np.nan
-    return o
-
-
-@st.cache_data(show_spinner="Loading survey data...")
-def load_default():
-    dfs = []
-    for path, fn in [("data/v5_pollfish.xlsx", normalize_v5),
-                     ("data/v8_pollfish.xlsx", normalize_v8)]:
-        if os.path.exists(path):
-            raw = pd.read_excel(path, sheet_name="Individuals")
-            dfs.append(fn(raw))
-    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-
-
-def load_uploaded(file, version):
-    raw = pd.read_excel(file, sheet_name="Individuals")
-    return normalize_v5(raw) if version == "v5" else normalize_v8(raw)
-
-
-# ── CHARTS ────────────────────────────────────────────────────────────────────
-def make_pie(labels, values, title, colors=None):
-    colors = (colors or [INDIGO,INDIGO_L,RED,GRAY,"#DC2626",AMBER,GREEN,"#7C3AED","#A78BFA","#4C1D95"])[:len(values)]
-    fig = plt.figure(figsize=(5,6)); fig.patch.set_facecolor("white")
-    ax = fig.add_axes([0.05,0.28,0.90,0.65])
-    wedges,_,autos = ax.pie(values, colors=colors, autopct=lambda p: f"{p:.0f}%" if p>=5 else "",
-                             startangle=90, pctdistance=0.72)
-    for at in autos: at.set_fontsize(11); at.set_fontweight("bold"); at.set_color("white")
-    ax.set_aspect("equal")
-    ax.set_title(title, fontsize=11, fontweight="bold", pad=10)
-    la = fig.add_axes([0.0,0.0,1.0,0.26]); la.set_axis_off()
-    la.legend(wedges, labels, fontsize=9, loc="center", ncol=2, frameon=False,
-              handlelength=1.2, handletextpad=0.4)
+# ── CHART HELPERS ─────────────────────────────────────────────────────────────
+def hbar(labels, vals, title, highlight_top=True, color=BLK, figw=8, figh=None):
+    figh = figh or max(2.5, len(labels) * 0.48)
+    fig, ax = plt.subplots(figsize=(figw, figh), facecolor=W)
+    ax.set_facecolor(W)
+    cols = []
+    for i, v in enumerate(vals):
+        if highlight_top and i == np.argmax(vals): cols.append(RED)
+        else: cols.append(color)
+    bars = ax.barh(labels, vals, color=cols, height=0.55, edgecolor='none')
+    for bar, val in zip(bars, vals):
+        ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2,
+                f'{val:.1f}%', va='center', ha='left', fontsize=9,
+                fontweight='bold', color=RED if val == max(vals) and highlight_top else BLK)
+    ax.set_title(title, fontsize=11, fontweight='bold', color=BLK, loc='left', pad=8)
+    ax.set_xlim(0, min(100, max(vals) * 1.25))
+    ax.spines[['right','top','bottom']].set_visible(False)
+    ax.spines['left'].set_color(LGY)
+    ax.tick_params(axis='x', bottom=False, labelbottom=False)
+    ax.tick_params(axis='y', labelsize=9, left=False, labelcolor=BLK)
+    fig.tight_layout()
     return fig
 
+def donut(labels, vals, title, colors=None, n_label=None):
+    if colors is None:
+        colors = [BLK, RED, '#555555', '#888888', LGY, GOLD, '#666666']
+    colors = colors[:len(labels)]
+    fig, ax = plt.subplots(figsize=(6, 5), facecolor=W)
+    ax.set_facecolor(W)
+    wedges, _, autotexts = ax.pie(
+        vals, colors=colors,
+        autopct=lambda p: f'{p:.0f}%' if p > 6 else '',
+        startangle=110, wedgeprops=dict(width=0.5, edgecolor=W, linewidth=2),
+        pctdistance=0.75)
+    for at in autotexts:
+        at.set_fontsize(10); at.set_fontweight('bold'); at.set_color(W)
+    if n_label:
+        ax.text(0, 0.06, n_label, ha='center', va='center', fontsize=9, color=GY)
+    patches = [mpatches.Patch(color=colors[i], label=f'{labels[i][:30]}  {vals[i]:.1f}%')
+               for i in range(len(labels))]
+    ax.legend(handles=patches, loc='lower center', bbox_to_anchor=(0.5, -0.22),
+              ncol=2, fontsize=8.5, frameon=False, labelcolor=BLK, handlelength=0.9)
+    ax.set_title(title, fontsize=11, fontweight='bold', color=BLK, pad=10)
+    fig.tight_layout()
+    return fig
 
-def make_hbar(labels, vals, title, cvals=None, clabel=None, blabel=None):
-    n = len(labels)
-    fig, ax = plt.subplots(figsize=(7, max(3.5, n*0.52)))
-    fig.patch.set_facecolor("white"); ax.set_facecolor("white")
-    y = np.arange(n)
-    if cvals is not None:
-        h = 0.35
-        b1 = ax.barh(y+h/2, vals, h, color=INDIGO, alpha=0.92, label=blabel or "Group A")
-        b2 = ax.barh(y-h/2, cvals, h, color=INDIGO_L, alpha=0.75, label=clabel or "Group B")
-        xmax = max(max(vals), max(cvals)) if vals and cvals else 1
-        for bar,v in zip(b1,vals):
-            ax.text(bar.get_width()+0.8, bar.get_y()+bar.get_height()/2, f"{v:.0f}%",
-                    va="center", fontsize=9, fontweight="bold", color=INDIGO)
-        for bar,v in zip(b2,cvals):
-            ax.text(bar.get_width()+0.8, bar.get_y()+bar.get_height()/2, f"{v:.0f}%",
-                    va="center", fontsize=9, color="#6B7280")
-        ax.legend(fontsize=9, loc="upper center", bbox_to_anchor=(0.5,-0.08), ncol=2, frameon=False)
-    else:
-        xmax = max(vals) if vals else 1
-        cs = [INDIGO if v==max(vals) else INDIGO_L if v>=25 else GRAY for v in vals]
-        bars = ax.barh(y, vals, color=cs, height=0.55)
-        for bar,v in zip(bars,vals):
-            ax.text(bar.get_width()+0.8, bar.get_y()+bar.get_height()/2, f"{v:.0f}%",
-                    va="center", fontsize=10, fontweight="bold", color="#1F2937")
-    ax.set_yticks(y); ax.set_yticklabels(labels, fontsize=10)
-    ax.set_xlim(0, xmax+16); ax.set_xlabel("% of Respondents", fontsize=10)
-    ax.set_title(title, fontsize=11, fontweight="bold", pad=10)
-    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
-    plt.tight_layout(); return fig
+def stat_box(stat, label, color=RED):
+    st.markdown(f"""<div class="stat-box">
+        <div class="stat-number" style="color:{color}">{stat}</div>
+        <div class="stat-label">{label}</div>
+    </div>""", unsafe_allow_html=True)
 
+def ratio_box(numerator, denominator, label):
+    st.markdown(f"""<div class="stat-box">
+        <div class="ratio-box">1 in {denominator}</div>
+        <div class="stat-label">{label}</div>
+    </div>""", unsafe_allow_html=True)
 
-# ── SIDEBAR FILTERS ───────────────────────────────────────────────────────────
-def sidebar_filters(df):
-    st.sidebar.markdown("## 🔍 Filters")
-    f = {}
-    def ms(label, col, key):
-        opts = sorted(df[col].dropna().unique().tolist())
-        return st.sidebar.multiselect(label, opts, default=opts, key=key)
+def quote_card(text, source="", tags=""):
+    source_html = f'<div class="quote-source">{source}</div>' if source else ''
+    st.markdown(f"""<div class="quote-card">
+        "{text}"
+        {source_html}
+    </div>""", unsafe_allow_html=True)
 
-    f["survey"]       = ms("Survey", "survey", "f_surv")
-    f["operation"]    = ms("Business operation", "operation", "f_op")
-    f["industry"]     = ms("Industry (self-reported)", "industry", "f_ind")
+# ── DOCUMENT TEXT EXTRACTION ──────────────────────────────────────────────────
+def extract_text_from_file(uploaded_file):
+    """Extract plain text from txt, pdf, docx uploads."""
+    name = uploaded_file.name.lower()
+    try:
+        if name.endswith('.txt'):
+            return uploaded_file.read().decode('utf-8', errors='ignore')
+        elif name.endswith('.pdf'):
+            try:
+                import PyPDF2
+                reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+                return '\n'.join(page.extract_text() or '' for page in reader.pages)
+            except Exception:
+                return "[PDF parsing failed -- try converting to .txt first]"
+        elif name.endswith('.docx'):
+            try:
+                from docx import Document
+                doc = Document(io.BytesIO(uploaded_file.read()))
+                return '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+            except Exception:
+                return "[DOCX parsing failed]"
+        else:
+            return uploaded_file.read().decode('utf-8', errors='ignore')
+    except Exception as e:
+        return f"[Could not read file: {e}]"
 
-    demo_opts = sorted(df["industry_demo"].dropna().unique().tolist())
-    if demo_opts:
-        sel_d = st.sidebar.multiselect("Industry (Pollfish demographic)", ["All"]+demo_opts, default=["All"], key="f_demo")
-        f["industry_demo"] = sel_d
+# ── DATA LOADERS ──────────────────────────────────────────────────────────────
+@st.cache_data
+def load_pollfish_agg(path):
+    """Load pre-aggregated Pollfish xlsx. Returns dict of {question: {answer: pct}}"""
+    df = pd.read_excel(path)
+    out = {}
+    for q in df['Question'].unique():
+        sub = df[df['Question']==q].copy()
+        sub = sub[sub['Answer'].notna()]
+        pcts = {}
+        for _, row in sub.iterrows():
+            ans = str(row['Answer']).strip()
+            pct = row['Respondents(%)'] if pd.notna(row['Respondents(%)']) else row['Answers(%)']
+            if pd.notna(pct):
+                pcts[ans] = round(float(pct) * 100, 1)
+        if pcts:
+            out[q] = pcts
+    return out
 
-    f["gut_reaction"] = ms("Gut reaction", "gut_reaction", "f_gut")
-    f["ad_status"]    = ms("Advertising status", "ad_status", "f_stat")
-    f["budget"]       = ms("Monthly budget", "budget", "f_bud")
-    f["region"]       = ms("Region", "region", "f_reg")
-    f["gender"]       = ms("Gender", "gender", "f_gen")
-    f["tenure"]       = ms("Business tenure", "tenure", "f_ten")
-    f["revenue"]      = ms("Annual revenue", "revenue", "f_rev")
+@st.cache_data
+def load_respondent_io(path):
+    df = pd.read_csv(path)
+    # All 70 answered the questions, use all of them
+    return df
 
-    mn = int(df["age"].dropna().min()) if df["age"].notna().any() else 18
-    mx = int(df["age"].dropna().max()) if df["age"].notna().any() else 70
-    f["age"] = st.sidebar.slider("Age range", mn, mx, (mn, mx), key="f_age")
+@st.cache_data
+def load_typeform_files():
+    """Load all typeform CSVs and combine completed responses."""
+    paths = [
+        '/mnt/user-data/uploads/responses-XsMlrGiq-01KQ0FB6HDPB174DD2HPCSWFB8-XQ7PGRMFGDL3F69J6NOSP759.csv',
+        '/mnt/user-data/uploads/responses-sMjKHB91-01KQ0F9Z0G9BQ2EKPHD6EC3726-PK1WLN2LH1Z79HNOE6ID6RHE.csv',
+        '/mnt/project/4_15__1_1_typeform_survey_responsesXsMlrGiq01KP975ZPR9DP97M43T4R6JAWP165HYRQLX6DWEAWB4F53KBHB.csv',
+    ]
+    frames = []
+    for p in paths:
+        try:
+            df = pd.read_csv(p)
+            completed = df[df['Response Type'].isin(['completed','partial'])]
+            completed = completed.assign(source_file=os.path.basename(p))
+            frames.append(completed)
+        except Exception:
+            pass
+    if frames:
+        # Align columns -- use union
+        all_cols = set()
+        for f in frames: all_cols.update(f.columns)
+        aligned = []
+        for f in frames:
+            for c in all_cols:
+                if c not in f.columns: f[c] = np.nan
+            aligned.append(f[sorted(all_cols)])
+        return pd.concat(aligned, ignore_index=True)
+    return pd.DataFrame()
 
-    nat_opts = sorted(df["nature_affects"].dropna().unique().tolist())
-    if nat_opts:
-        sel_n = st.sidebar.multiselect("Nature affects advertising (v8)", ["All"]+nat_opts, default=["All"], key="f_nat")
-        f["nature_affects"] = sel_n
+# ── KEY METRIC CALCULATIONS ───────────────────────────────────────────────────
+def compute_ratio(pct):
+    """Convert a percentage to '1 in N' string."""
+    if pct <= 0: return "N/A"
+    n = round(100 / pct)
+    return str(n)
 
-    return f
+# ── SESSION STATE INIT ────────────────────────────────────────────────────────
+if 'uploaded_docs' not in st.session_state:
+    st.session_state.uploaded_docs = []  # list of {name, source_type, text, date}
+if 'extra_typeforms' not in st.session_state:
+    st.session_state.extra_typeforms = []
+if 'api_key' not in st.session_state:
+    st.session_state.api_key = ''
 
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ad101")
+    st.markdown("**Research Explorer**")
+    st.markdown("---")
 
-def apply_filters(df, f):
-    m = pd.Series(True, index=df.index)
-    for col, val in f.items():
-        if col == "age":
-            m &= df["age"].between(val[0], val[1])
-        elif col == "industry_demo" and val != ["All"]:
-            m &= df["industry_demo"].isin(val)
-        elif col == "nature_affects" and val != ["All"]:
-            m &= df["nature_affects"].isin(val)
-        elif isinstance(val, list) and val:
-            m &= df[col].isin(val)
-    return df[m].copy()
+    # API Key
+    st.markdown("#### Anthropic API Key")
+    st.markdown('<span style="font-size:0.78rem;color:#888">Required only for Content Studio</span>', unsafe_allow_html=True)
+    api_key = st.text_input("API Key", type="password",
+                             value=st.session_state.api_key,
+                             placeholder="sk-ant-...",
+                             label_visibility="collapsed")
+    if api_key:
+        st.session_state.api_key = api_key
+        st.success("Key saved for this session")
 
+    st.markdown("---")
+    st.markdown("#### Data Sources")
+    st.markdown("""
+- 📊 Pollfish v5 — n=100
+- 📊 Pollfish v8 — n=240
+- 🔬 Respondent.io — n=70
+- 📝 Typeform (product) — n=13
+    """)
+    if st.session_state.uploaded_docs:
+        st.markdown(f"- 📄 Uploaded docs — {len(st.session_state.uploaded_docs)} files")
+
+# ── LOAD DATA ─────────────────────────────────────────────────────────────────
+try:
+    v5 = load_pollfish_agg('/mnt/user-data/uploads/v5_pollfish.xlsx')
+    v8 = load_pollfish_agg('/mnt/user-data/uploads/v8_pollfish.xlsx')
+    POLLFISH_OK = True
+except Exception as e:
+    v5 = {}; v8 = {}; POLLFISH_OK = False
+    st.warning(f"Pollfish files not found: {e}")
+
+try:
+    resp_df = load_respondent_io(
+        '/mnt/user-data/uploads/Project_Small-Business-Owners-Insights-on-Advertising-Challenges-Solutions_Responses_1777058789201.csv')
+    RESP_OK = True
+except Exception:
+    resp_df = pd.DataFrame(); RESP_OK = False
+
+try:
+    tf_df = load_typeform_files()
+    TF_OK = len(tf_df) > 0
+except Exception:
+    tf_df = pd.DataFrame(); TF_OK = False
+
+# ── HEADER ────────────────────────────────────────────────────────────────────
+st.markdown("# ad101 Research Explorer")
+st.markdown(f"*{340 + len(resp_df)} total respondents across all sources · Updated {datetime.now().strftime('%B %d, %Y')}*")
+st.markdown("---")
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-def tab_overview(df):
-    n = len(df)
-    st.markdown(f"### Overview — **{n} respondents** match current filters")
-    if n == 0: st.warning("No respondents match the current filters."); return
+tabs = st.tabs([
+    "📊 Market Research",
+    "🧪 Product Feedback",
+    "💬 Quotes & Open Text",
+    "✍️ Content Studio",
+    "📁 Upload Data"
+])
 
-    sv = df["survey"].value_counts()
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 1: MARKET RESEARCH
+# ════════════════════════════════════════════════════════════════════════════
+with tabs[0]:
+    st.markdown('<div class="section-chip">MARKET RESEARCH</div>', unsafe_allow_html=True)
+    st.markdown("## What 340+ SMB owners told us about advertising")
+    st.markdown("*Pollfish v5 (n=100) + Pollfish v8 (n=240) + Respondent.io (n=70) — combined n=410*")
+
+    # ── TOP STATS ROW ─────────────────────────────────────────────────────
+    st.markdown("### At a glance")
     c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Total", n)
-    c2.metric("v5 General", int(sv.get("v5 — General SMB",0)))
-    c3.metric("v8 Online/Hybrid", int(sv.get("v8 — Online/Hybrid",0)))
-    c4.metric("Median age", int(df["age"].median()) if df["age"].notna().any() else "—")
-    conf = round(df["gut_reaction"].str.contains("confident",case=False,na=False).sum()/n*100)
-    c5.metric("Feel confident", f"{conf}%")
+    with c1: stat_box("39%", "say knowing where to advertise is hardest")
+    with c2: stat_box("55%", "actively advertising but want better results")
+    with c3: stat_box("44%", "want content & visual help after a plan")
+    with c4: stat_box("10%", "spend over $3K/month on ads")
+    with c5:
+        st.markdown("""<div class="stat-box">
+            <div class="ratio-box">1 in 3</div>
+            <div class="stat-label">would spend more if they saw results first</div>
+        </div>""", unsafe_allow_html=True)
 
-    st.divider()
-    c1,c2 = st.columns(2)
-    with c1:
-        vc = vcpct(df,"gut_reaction")
-        if vc: st.pyplot(make_pie(list(vc.keys()),[round(v,1) for v in vc.values()],"Gut Reaction",
-                                   colors=[INDIGO,INDIGO_L,RED,GRAY,"#DC2626"]))
-    with c2:
-        vc = vcpct(df,"ad_status")
-        if vc: st.pyplot(make_pie(list(vc.keys()),[round(v,1) for v in vc.values()],"Advertising Status",
-                                   colors=[INDIGO,RED,INDIGO_L,GRAY]))
-    c1,c2 = st.columns(2)
-    with c1:
-        vc = vcpct(df,"budget")
-        if vc: st.pyplot(make_pie(list(vc.keys()),[round(v,1) for v in vc.values()],"Monthly Budget",
-                                   colors=[INDIGO,GRAY,INDIGO_L,"#7C3AED","#9CA3AF","#A78BFA","#4C1D95"]))
-    with c2:
-        vc = vcpct(df,"ai_attitude")
-        if vc: st.pyplot(make_pie(list(vc.keys()),[round(v,1) for v in vc.values()],"AI Attitudes",
-                                   colors=[INDIGO,GREEN,GRAY,AMBER,RED]))
+    st.markdown("---")
 
+    # ── SOURCE SELECTOR ───────────────────────────────────────────────────
+    source = st.radio("Data source", ["Combined (Pollfish v5+v8)", "Pollfish v5 only",
+                                       "Pollfish v8 only", "Respondent.io only"],
+                      horizontal=True)
 
-def tab_questions(df):
-    n = len(df)
-    if n == 0: st.warning("No respondents match the current filters."); return
-    st.markdown(f"### All Questions — **{n} respondents**")
+    # ── QUESTION BROWSER ──────────────────────────────────────────────────
+    st.markdown("### Browse by question")
 
-    sec = st.selectbox("Section", ["Gut reaction & status","Hardest parts","Success metrics (v8)",
-                                    "Budget & help wanted","Worries & involvement",
-                                    "Online channels","AI & jargon","Regulation (v8)","Advice sources"])
+    # Build unified question list
+    all_questions = {}
+    if POLLFISH_OK:
+        for q, d in v5.items(): all_questions[f"[v5] {q}"] = d
+        for q, d in v8.items(): all_questions[f"[v8] {q}"] = d
 
-    if sec == "Gut reaction & status":
-        c1,c2 = st.columns(2)
-        with c1:
-            vc = vcpct(df,"gut_reaction")
-            if vc: st.pyplot(make_hbar([k[:35] for k in vc],[round(v,1) for v in vc.values()],"Gut reaction"))
-        with c2:
-            vc = vcpct(df,"ad_status")
-            if vc: st.pyplot(make_hbar([k[:35] for k in vc],[round(v,1) for v in vc.values()],"Advertising status"))
-        vc = vcpct(df,"tenure")
-        if vc: st.pyplot(make_hbar([k[:35] for k in vc],[round(v,1) for v in vc.values()],"Business tenure"))
+    # Respondent.io categorical questions
+    if RESP_OK and len(resp_df) > 0:
+        resp_cats = {
+            "10-When you think about advertising your business, what's your gut reaction?": "Gut reaction (Respondent.io)",
+            "11-Which best describes where you are with advertising right now?": "Ad status (Respondent.io)",
+            "12-How much time do you realistically spend on marketing and advertising per week": "Time spent weekly (Respondent.io)",
+            "5-How does your business primarily operate": "Operating mode (Respondent.io)",
+            "6-What was your 2025 company revenue": "Revenue 2025 (Respondent.io)",
+            "7-What is your current monthly advertising budget? ": "Monthly ad budget (Respondent.io)",
+        }
+        for col, label in resp_cats.items():
+            if col in resp_df.columns:
+                vc = resp_df[col].value_counts(normalize=True)*100
+                all_questions[f"[Respondent.io] {label}"] = vc.round(1).to_dict()
 
-    elif sec == "Hardest parts":
-        mp = mpct(df,"hard_")
-        labels = {"hard knowing where":"Where to advertise","hard who to reach":"Who to reach",
-                  "hard how much":"How much to spend","hard creating ads":"Creating actual ads",
-                  "hard finding time":"Finding time","hard understanding":"Understanding results",
-                  "hard trusting advice":"Trusting the advice"}
-        d = {labels.get(k,k):v for k,v in sorted(mp.items(), key=lambda x:x[1],reverse=True)}
-        if d: st.pyplot(make_hbar(list(d.keys()),list(d.values()),"Hardest parts of advertising (pick 2)"))
+    if not all_questions:
+        st.info("Upload Pollfish xlsx files in the Upload Data tab to see charts here.")
+    else:
+        # Filter by source
+        if source == "Pollfish v5 only":
+            show_q = {k:v for k,v in all_questions.items() if k.startswith("[v5]")}
+        elif source == "Pollfish v8 only":
+            show_q = {k:v for k,v in all_questions.items() if k.startswith("[v8]")}
+        elif source == "Respondent.io only":
+            show_q = {k:v for k,v in all_questions.items() if k.startswith("[Respondent.io]")}
+        else:
+            show_q = all_questions
 
-    elif sec == "Success metrics (v8)":
-        v8 = df[df["survey"]=="v8 — Online/Hybrid"]
-        if len(v8)==0: st.info("v8 only — adjust filters."); return
-        from collections import Counter
-        items = []
-        for val in v8["success_def"].dropna():
-            items.extend([x.strip() for x in str(val).split(",") if x.strip()])
-        cnt = Counter(items)
-        total = len(v8)
-        pairs = sorted([(k,round(v/total*100,1)) for k,v in cnt.items()],key=lambda x:x[1],reverse=True)
-        if pairs:
-            ls,vs = zip(*pairs)
-            st.pyplot(make_hbar(list(ls),list(vs),f"What does 'working' mean? (v8, n={total})"))
+        selected_q = st.selectbox("Select question", list(show_q.keys()))
+        if selected_q:
+            data = show_q[selected_q]
+            labels = list(data.keys())
+            vals = list(data.values())
+            if len(labels) > 0:
+                col_chart, col_stats = st.columns([2,1])
+                with col_chart:
+                    if len(labels) <= 5:
+                        fig = donut(labels, vals, selected_q.split("] ",1)[-1][:60],
+                                   n_label=None)
+                    else:
+                        # Sort descending for bar chart
+                        pairs = sorted(zip(vals, labels), reverse=True)
+                        sv, sl = zip(*pairs)
+                        fig = hbar(list(sl), list(sv), selected_q.split("] ",1)[-1][:60])
+                    st.pyplot(fig, use_container_width=True)
+                with col_stats:
+                    st.markdown("**Key numbers**")
+                    top = sorted(zip(vals, labels), reverse=True)
+                    for v, l in top[:4]:
+                        n_in = compute_ratio(v)
+                        st.markdown(f"""<div class="stat-box">
+                            <div class="stat-number">{v:.0f}%</div>
+                            <div class="stat-label">{l[:40]}</div>
+                            <div style="color:{GY};font-size:0.75rem;margin-top:4px">1 in {n_in} respondents</div>
+                        </div>""", unsafe_allow_html=True)
 
-    elif sec == "Budget & help wanted":
-        c1,c2 = st.columns(2)
-        with c1:
-            vc = vcpct(df,"budget")
-            if vc: st.pyplot(make_hbar([k[:30] for k in vc],[round(v,1) for v in vc.values()],"Monthly budget"))
-        with c2:
-            mp = mpct(df,"help_")
-            d = {k.replace("_"," ")[:35]:v for k,v in sorted(mp.items(),key=lambda x:x[1],reverse=True)}
-            if d: st.pyplot(make_hbar(list(d.keys()),list(d.values()),"Help wanted after a plan"))
+    st.markdown("---")
 
-    elif sec == "Worries & involvement":
-        c1,c2 = st.columns(2)
-        with c1:
-            mp = mpct(df,"worry_")
-            wl = {"worry wasting money":"Wasting money","worry unexpected":"Unexpected charges",
-                  "worry brand fit":"Brand fit","worry not knowing":"Not knowing",
-                  "worry cant pause":"Can't pause","worry bad reports":"Bad reports"}
-            d = {wl.get(k,k):v for k,v in sorted(mp.items(),key=lambda x:x[1],reverse=True)}
-            if d: st.pyplot(make_hbar(list(d.keys()),list(d.values()),"Worries about paid execution"))
-        with c2:
-            vc = vcpct(df,"involvement")
-            if vc: st.pyplot(make_hbar([k[:35] for k in vc],[round(v,1) for v in vc.values()],"Desired involvement"))
+    # ── RESPONDENT.IO DEEP FILTERS ────────────────────────────────────────
+    if RESP_OK and len(resp_df) > 0:
+        st.markdown("### Filter Respondent.io individual responses (n=70)")
+        col1,col2,col3 = st.columns(3)
+        with col1:
+            gut_opts = resp_df["10-When you think about advertising your business, what's your gut reaction?"].dropna().unique().tolist()
+            gut_sel = st.multiselect("Gut reaction", gut_opts, default=gut_opts)
+        with col2:
+            ind_opts = resp_df["3-What industry is your business in? "].dropna().unique().tolist()
+            ind_sel = st.multiselect("Industry", ind_opts, default=ind_opts)
+        with col3:
+            rev_opts = resp_df["6-What was your 2025 company revenue"].dropna().unique().tolist()
+            rev_sel = st.multiselect("Revenue", rev_opts, default=rev_opts)
 
-    elif sec == "Online channels":
-        mp = mpct(df,"ch_")
-        cl = {"ch fb organic":"FB/IG organic","ch fb ads":"FB/IG ads","ch google ads":"Google Ads",
-              "ch email":"Email","ch tiktok":"TikTok","ch yelp gbp":"Yelp/GBP","ch ai tool":"AI tool"}
-        d = {cl.get(k,k):v for k,v in sorted(mp.items(),key=lambda x:x[1],reverse=True) if "no online" not in k}
-        if d: st.pyplot(make_hbar(list(d.keys()),list(d.values()),"Current online channels"))
+        gut_col = "10-When you think about advertising your business, what's your gut reaction?"
+        ind_col = "3-What industry is your business in? "
+        rev_col = "6-What was your 2025 company revenue"
+        mask = (
+            resp_df[gut_col].isin(gut_sel) &
+            resp_df[ind_col].isin(ind_sel) &
+            resp_df[rev_col].isin(rev_sel)
+        )
+        filtered_resp = resp_df[mask]
+        st.markdown(f"**{len(filtered_resp)} of {len(resp_df)} respondents match**")
 
-    elif sec == "AI & jargon":
-        c1,c2 = st.columns(2)
-        with c1:
-            vc = vcpct(df,"ai_attitude")
-            if vc: st.pyplot(make_hbar([k[:35] for k in vc],[round(v,1) for v in vc.values()],"AI attitudes"))
-        with c2:
-            jcols = ["jarg_target","jarg_paid","jarg_organic","jarg_programmatic","jarg_channel"]
-            jnames = ["Target Audience","Paid media","Organic reach","Programmatic adv.","Channel strategy"]
-            pcts = [round((df[c].dropna()>=2).sum()/max(df[c].notna().sum(),1)*100,1) if c in df.columns else 0 for c in jcols]
-            st.pyplot(make_hbar(jnames,pcts,"Jargon familiarity (familiar or rough idea)"))
+        if len(filtered_resp) > 0:
+            hard_col = "13-What feels like the hardest part of advertising your business? (select top 2)"
+            hardest_cols = [c for c in resp_df.columns if c.startswith("13-") and "_" in c]
+            if hardest_cols:
+                hard_data = {}
+                for c in hardest_cols:
+                    label = c.split("_",1)[-1].strip()[:50]
+                    pct = filtered_resp[c].notna().sum() / max(len(filtered_resp),1) * 100
+                    if pct > 0: hard_data[label] = round(pct, 1)
+                if hard_data:
+                    pairs = sorted(hard_data.items(), key=lambda x:-x[1])
+                    fig = hbar([p[0] for p in pairs], [p[1] for p in pairs],
+                               "Hardest parts of advertising (filtered)")
+                    st.pyplot(fig, use_container_width=True)
 
-    elif sec == "Regulation (v8)":
-        v8 = df[df["survey"]=="v8 — Online/Hybrid"]
-        if len(v8)==0: st.info("v8 only."); return
-        vc = vcpct(v8,"nature_affects")
-        if vc: st.pyplot(make_hbar([k[:50] for k in vc],[round(v,1) for v in vc.values()],
-                                    f"Nature affects advertising (v8, n={len(v8)})"))
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 2: PRODUCT FEEDBACK
+# ════════════════════════════════════════════════════════════════════════════
+with tabs[1]:
+    st.markdown('<div class="section-chip">PRODUCT FEEDBACK</div>', unsafe_allow_html=True)
+    st.markdown("## How real users experienced ad101 + Zansei")
 
-    elif sec == "Advice sources":
-        mp = mpct(df,"adv_")
-        al = {"adv google":"Google","adv youtube":"YouTube","adv social":"Instagram/TikTok",
-              "adv reddit":"Reddit","adv fb groups":"Facebook groups","adv linkedin":"LinkedIn",
-              "adv ai":"AI tools","adv peers":"Other business owners"}
-        d = {al.get(k,k):v for k,v in sorted(mp.items(),key=lambda x:x[1],reverse=True) if "dont look" not in k}
-        if d: st.pyplot(make_hbar(list(d.keys()),list(d.values()),"Where do you look for advice?"))
+    # Combine all typeform + uploaded typeforms
+    all_tf = tf_df.copy() if TF_OK else pd.DataFrame()
+    for extra in st.session_state.extra_typeforms:
+        all_tf = pd.concat([all_tf, extra], ignore_index=True)
 
+    n_tf = len(all_tf)
+    st.markdown(f"*{n_tf} completed product survey responses + {len(st.session_state.uploaded_docs)} uploaded documents*")
 
-def tab_compare(df):
-    st.markdown("### Compare Two Segments Side by Side")
-    st.info("Sidebar filters apply to both groups. Use controls below to split within that population.")
-    c1,c2 = st.columns(2)
-    def grp_controls(label, suffix):
-        with (c1 if suffix=="a" else c2):
-            st.markdown(f"**{label}**")
-            gut = st.multiselect("Gut reaction", df["gut_reaction"].dropna().unique().tolist(),
-                                  default=df["gut_reaction"].dropna().unique().tolist(), key=f"cg_{suffix}")
-            surv = st.multiselect("Survey", df["survey"].dropna().unique().tolist(),
-                                   default=df["survey"].dropna().unique().tolist(), key=f"cs_{suffix}")
-            bud = st.multiselect("Budget", df["budget"].dropna().unique().tolist(),
-                                  default=df["budget"].dropna().unique().tolist(), key=f"cb_{suffix}")
-        return df[df["gut_reaction"].isin(gut) & df["survey"].isin(surv) & df["budget"].isin(bud)]
+    if n_tf > 0:
+        # ── RATING SCORES ─────────────────────────────────────────────────
+        st.markdown("### Ratings (out of 5)")
+        rating_fields = {
+            "Conversation ease": ["The Chat:\n\nHow easy was the conversation to follow?",
+                                  "The Zansei conversation:\n\nHow easy was the conversation to follow?"],
+            "Plan relevance": ["The Plan: \n\nHow much did the plan feel relevant to your needs?"],
+            "Plan specificity": ["The Plan: \n\nDid the plan feel like it was built for your business specifically?"],
+        }
+        r_cols = st.columns(len(rating_fields))
+        for i, (label, col_variants) in enumerate(rating_fields.items()):
+            vals = []
+            for col in col_variants:
+                if col in all_tf.columns:
+                    vals.extend(all_tf[col].dropna().tolist())
+            if vals:
+                avg = round(np.mean([float(v) for v in vals if str(v).replace('.','').isdigit()]), 1)
+                with r_cols[i]:
+                    st.markdown(f"""<div class="stat-box">
+                        <div class="stat-number">{avg}/5</div>
+                        <div class="stat-label">{label}</div>
+                        <div style="color:{GY};font-size:0.75rem">n={len(vals)}</div>
+                    </div>""", unsafe_allow_html=True)
 
-    ga = grp_controls("Group A","a")
-    gb = grp_controls("Group B","b")
-    st.markdown(f"**Group A:** {len(ga)} &nbsp; **Group B:** {len(gb)}")
-    st.divider()
-    if len(ga)==0 or len(gb)==0: st.warning("One or both groups are empty."); return
+        st.markdown("---")
 
-    metric = st.selectbox("Compare on",["Hardest parts","Worries","Help wanted","Online channels",
-                                         "AI attitudes","Ad status","Involvement"])
-    def gv(grp, prefix, rn):
-        return {rn.get(k.replace("_"," "),k):v for k,v in mpct(grp,prefix).items()}
+        # ── CATEGORICAL BREAKDOWNS ────────────────────────────────────────
+        st.markdown("### Would they recommend / register / pay?")
+        cat_map = {
+            "Would recommend": "Last Question! \n\nWould you recommend ad101 to another business owner?",
+            "Would pay for execution": "Pricing:\n\nAfter going through this experience, would you consider paying for help executing your advertising plan?",
+            "Would register": "Would you register for ad101.com if it saved your chat, plan, and allowed you to continue your conversations, get more specific advice, and refine or create new advertising plans? ",
+        }
+        cat_cols = st.columns(len(cat_map))
+        for i, (label, col) in enumerate(cat_map.items()):
+            with cat_cols[i]:
+                if col in all_tf.columns:
+                    vc = all_tf[col].dropna().value_counts()
+                    st.markdown(f"**{label}** (n={vc.sum()})")
+                    for ans, cnt in vc.items():
+                        pct = cnt/vc.sum()*100
+                        color = GL if "yes" in str(ans).lower() else GY
+                        st.markdown(f"- {ans[:40]}: **{pct:.0f}%**")
 
-    if metric=="Hardest parts":
-        rn={"hard knowing where":"Where to advertise","hard who to reach":"Who to reach",
-            "hard how much":"How much","hard creating ads":"Creating ads","hard finding time":"Time",
-            "hard understanding":"Understanding","hard trusting advice":"Trusting advice"}
-        va=gv(ga,"hard_",rn); vb=gv(gb,"hard_",rn)
-    elif metric=="Worries":
-        rn={"worry wasting money":"Wasting money","worry unexpected":"Unexpected",
-            "worry brand fit":"Brand fit","worry not knowing":"Not knowing",
-            "worry cant pause":"Can't pause","worry bad reports":"Bad reports"}
-        va=gv(ga,"worry_",rn); vb=gv(gb,"worry_",rn)
-    elif metric=="Help wanted":
-        rn={"help running ads":"Running ads","help content visuals":"Content",
-            "help social media":"Social","help email":"Email","help measuring":"Measuring",
-            "help try myself":"Try myself","help nothing":"Nothing"}
-        va=gv(ga,"help_",rn); vb=gv(gb,"help_",rn)
-    elif metric=="Online channels":
-        rn={"ch fb organic":"FB organic","ch fb ads":"FB ads","ch google ads":"Google",
-            "ch email":"Email","ch tiktok":"TikTok","ch yelp gbp":"Yelp/GBP"}
-        va=gv(ga,"ch_",rn); vb=gv(gb,"ch_",rn)
-    elif metric=="AI attitudes":
-        va=vcpct(ga,"ai_attitude"); vb=vcpct(gb,"ai_attitude")
-    elif metric=="Ad status":
-        va=vcpct(ga,"ad_status"); vb=vcpct(gb,"ad_status")
-    elif metric=="Involvement":
-        va=vcpct(ga,"involvement"); vb=vcpct(gb,"involvement")
+        st.markdown("---")
 
-    keys = sorted(set(list(va.keys())+list(vb.keys())))
-    fig = make_hbar([k[:40] for k in keys],[round(va.get(k,0),1) for k in keys],
-                    f"{metric} — A vs B",
-                    cvals=[round(vb.get(k,0),1) for k in keys],
-                    blabel=f"Group A (n={len(ga)})", clabel=f"Group B (n={len(gb)})")
-    st.pyplot(fig, use_container_width=False)
+        # ── WHAT ZANSEI MISSED ─────────────────────────────────────────────
+        st.markdown("### What users said Zansei missed")
+        missed_cols = [c for c in all_tf.columns if "didn't ask" in c.lower() or "missing" in c.lower()]
+        for col in missed_cols:
+            for val in all_tf[col].dropna():
+                if len(str(val)) > 20 and str(val).lower() not in ['n/a','na','nan','no','none']:
+                    quote_card(str(val), source="Typeform product survey")
 
+    else:
+        st.info("No product survey data loaded. Upload Typeform CSVs in the Upload Data tab.")
 
-def tab_open_ended(df):
-    st.markdown("### Open-Ended Responses")
-    rs = df["open_ended"].dropna()
-    rs = rs[~rs.astype(str).str.strip().str.lower().isin(["n/a","na","nan","","nothing"])]
-    st.markdown(f"**{len(rs)} responses** match current filters.")
-    q = st.text_input("Search", placeholder="Filter by keyword...")
-    if q: rs = rs[rs.astype(str).str.contains(q,case=False,na=False)]
-    for i,(idx,resp) in enumerate(rs.items()):
-        if i>=200: st.info("Showing first 200. Use search to narrow down."); break
-        row = df.loc[idx]
-        tag = "v5" if "v5" in str(row.get("survey","")) else "v8"
-        ind = str(row.get("industry",""))[:22]
-        gut = str(row.get("gut_reaction",""))[:22]
-        st.markdown(f"**[{tag} · {ind} · {gut}]** {resp}")
+    # ── UPLOADED DOCUMENTS SEARCH ─────────────────────────────────────────
+    if st.session_state.uploaded_docs:
+        st.markdown("---")
+        st.markdown("### Search interview summaries & transcripts")
+        search_q = st.text_input("Search across all uploaded documents", placeholder="e.g. Zansei, pricing, competitor...")
+        doc_filter = st.multiselect("Filter by document type",
+                                     list(set(d['source_type'] for d in st.session_state.uploaded_docs)),
+                                     default=list(set(d['source_type'] for d in st.session_state.uploaded_docs)))
 
+        docs_to_search = [d for d in st.session_state.uploaded_docs if d['source_type'] in doc_filter]
 
-def tab_upload(df):
-    st.markdown("### Add New Survey Data")
-    col1,col2 = st.columns([2,1])
+        if search_q:
+            st.markdown(f"**Results for '{search_q}'**")
+            found = 0
+            for doc in docs_to_search:
+                text = doc['text']
+                # Find sentences containing the search term
+                sentences = re.split(r'(?<=[.!?])\s+', text)
+                matches = [s.strip() for s in sentences
+                           if search_q.lower() in s.lower() and len(s.strip()) > 20]
+                if matches:
+                    st.markdown(f"**📄 {doc['name']}** ({doc['source_type']})")
+                    for m in matches[:5]:
+                        # Highlight match
+                        highlighted = m.replace(search_q, f"**{search_q}**")
+                        quote_card(highlighted, source=doc['name'])
+                    found += len(matches)
+            if found == 0:
+                st.info(f"No results for '{search_q}' in uploaded documents.")
+        else:
+            # Show document list
+            for doc in docs_to_search:
+                with st.expander(f"📄 {doc['name']} ({doc['source_type']}) — {doc['date']}"):
+                    st.markdown(doc['text'][:2000] + ("..." if len(doc['text']) > 2000 else ""))
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 3: QUOTES & OPEN TEXT
+# ════════════════════════════════════════════════════════════════════════════
+with tabs[2]:
+    st.markdown('<div class="section-chip">QUOTES & OPEN TEXT</div>', unsafe_allow_html=True)
+    st.markdown("## What they said, in their own words")
+
+    # ── FILTERS ───────────────────────────────────────────────────────────
+    col1, col2, col3 = st.columns([2,1,1])
     with col1:
-        up = st.file_uploader("Upload Pollfish Excel (.xlsx)", type=["xlsx"])
+        search_term = st.text_input("Search quotes", placeholder="e.g. results, budget, trust, agency...")
     with col2:
-        ver = st.radio("Survey version", ["v5","v8"], index=1)
-    if up:
-        try:
-            nd = load_uploaded(up, ver)
-            st.success(f"Loaded {len(nd)} respondents.")
-            st.session_state["uploaded"] = nd
-            st.dataframe(nd[["survey","industry","gut_reaction","ad_status","budget","region","age","gender"]].head())
-        except Exception as e:
-            st.error(f"Error: {e}")
-    if "uploaded" in st.session_state:
-        st.info(f"📎 {len(st.session_state['uploaded'])} uploaded respondents included in this session.")
-    st.divider()
-    st.markdown("""
-**Adding data permanently:** Commit the new `.xlsx` to `data/` in your GitHub repo and update `load_default()` in `app.py` to include it. Streamlit redeploys automatically.
+        source_filter = st.multiselect("Source", ["Respondent.io", "Typeform", "Pollfish open-ended"],
+                                        default=["Respondent.io", "Typeform", "Pollfish open-ended"])
+    with col3:
+        theme_filter = st.selectbox("Theme", ["All", "Results & proof", "Budget & spend",
+                                               "Trust & advice", "Audience & reach",
+                                               "Time & effort", "Plan quality"])
 
-**Adding a new survey version:** Ask Claude to write a `normalize_vX()` function — provide the column structure from the Pollfish export and it takes ~10 minutes.
-""")
+    theme_keywords = {
+        "Results & proof": ["results", "proof", "working", "roi", "return", "know if"],
+        "Budget & spend": ["budget", "spend", "cost", "money", "expensive", "afford", "invest"],
+        "Trust & advice": ["trust", "advice", "confident", "know what", "recommend", "reliable"],
+        "Audience & reach": ["audience", "reach", "who", "customer", "target", "people"],
+        "Time & effort": ["time", "effort", "manage", "busy", "overwhelm", "bandwidth"],
+        "Plan quality": ["plan", "specific", "generic", "actionable", "clear", "useful"],
+    }
 
+    def matches_theme(text, theme):
+        if theme == "All": return True
+        kws = theme_keywords.get(theme, [])
+        return any(kw in str(text).lower() for kw in kws)
 
-def tab_raw(df):
-    st.markdown(f"### Raw Data — {len(df)} respondents")
-    cols = [c for c in ["survey","respondent_id","age","gender","region","state","industry",
-                         "industry_demo","tenure","revenue","operation","gut_reaction",
-                         "ad_status","budget","ai_attitude","involvement","nature_affects"] if c in df.columns]
-    st.dataframe(df[cols], use_container_width=True)
-    csv = df[cols].to_csv(index=False)
-    st.download_button("Download CSV", csv,
-                       file_name=f"ad101_filtered_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                       mime="text/csv")
+    def matches_search(text, term):
+        if not term: return True
+        return term.lower() in str(text).lower()
 
+    # ── RESPONDENT.IO QUOTES ──────────────────────────────────────────────
+    if RESP_OK and "Respondent.io" in source_filter:
+        st.markdown("### Respondent.io open responses (n=70)")
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-def main():
-    if not check_password(): return
+        q15_col = "15-What's the one thing that would make you more confident in your advertising decisions?"
+        q14_col = "14-Where do you currently advertise (ex/ Google ads, facebook, newspaper ads, instagram, direct mail, Linkedin, podcasts, word of mouth etc)"
 
-    st.markdown(f'<h1 style="color:{INDIGO};margin-bottom:2px">ad101 Survey Explorer</h1>'
-                f'<p style="color:{GRAY};margin-top:0">v5 General SMB · v8 Online/Hybrid · Any filter, any lens</p>',
-                unsafe_allow_html=True)
+        for col_label, col in [("What would make them more confident", q15_col),
+                                 ("Where they currently advertise", q14_col)]:
+            st.markdown(f"**{col_label}**")
+            if col in resp_df.columns:
+                shown = 0
+                for i, row in resp_df.iterrows():
+                    text = str(row.get(col, ""))
+                    if len(text) < 15 or text.lower() in ['nan','n/a','na']: continue
+                    if not matches_search(text, search_term): continue
+                    if not matches_theme(text, theme_filter): continue
+                    # Build source label
+                    gut = str(row.get("10-When you think about advertising your business, what's your gut reaction?",""))[:35]
+                    ind = str(row.get("3-What industry is your business in? ",""))[:25]
+                    budget = str(row.get("7-What is your current monthly advertising budget? ",""))[:20]
+                    source = f"Respondent.io · {ind} · {gut[:30]}"
+                    quote_card(text, source=source)
+                    shown += 1
+                    if shown >= 20: st.caption("Showing first 20 — use search to narrow"); break
+            st.markdown("")
 
-    base = load_default()
-    if "uploaded" in st.session_state:
-        base = pd.concat([base, st.session_state["uploaded"]], ignore_index=True)
+    # ── TYPEFORM QUOTES ───────────────────────────────────────────────────
+    if TF_OK and "Typeform" in source_filter:
+        st.markdown("### Typeform product survey responses")
+        tf_quote_cols = [
+            ("What a good plan would include", "In your own words, what would a really good advertising plan for your business include? What would it need to cover for you to trust it and act on it?"),
+            ("What Zansei missed", "Was there anything important about your business that Zansei didn't ask about that was also missing from teh plan?"),
+            ("What they'd do with $1000", "If you had $1000 to spend on your business today, how would you use it?"),
+            ("What they want help with after the plan", "The Plan: \n\nAfter seeing your plan, is there anything you would want ad101 to help you with?"),
+        ]
+        for label, col in tf_quote_cols:
+            relevant = all_tf if TF_OK else pd.DataFrame()
+            if col not in relevant.columns: continue
+            quotes = relevant[col].dropna()
+            quotes = quotes[quotes.apply(lambda x: len(str(x)) > 20)]
+            quotes = quotes[quotes.apply(lambda x: matches_search(x, search_term))]
+            quotes = quotes[quotes.apply(lambda x: matches_theme(x, theme_filter))]
+            if len(quotes) > 0:
+                st.markdown(f"**{label}** ({len(quotes)} responses)")
+                for val in quotes:
+                    company = ""
+                    quote_card(str(val), source=f"Typeform · {label}")
 
-    if base.empty:
-        st.error("No data found. Use the Add Data tab to upload survey files.")
-        tab_upload(base); return
+    # ── POLLFISH OPEN-ENDED ───────────────────────────────────────────────
+    if POLLFISH_OK and "Pollfish open-ended" in source_filter:
+        st.markdown("### Pollfish open-ended (aggregated summaries)")
+        st.info("Pollfish data is pre-aggregated -- individual quotes not available. Raw CSVs contain full individual responses. Upload the raw Pollfish CSV export in Upload Data for individual quotes.")
 
-    filters = sidebar_filters(base)
-    filtered = apply_filters(base, filters)
+    # ── UPLOADED DOC QUOTES ───────────────────────────────────────────────
+    if st.session_state.uploaded_docs:
+        st.markdown("### From uploaded documents")
+        for doc in st.session_state.uploaded_docs:
+            sentences = re.split(r'(?<=[.!?])\s+', doc['text'])
+            matches = [s.strip() for s in sentences
+                      if len(s.strip()) > 40
+                      and matches_search(s, search_term)
+                      and matches_theme(s, theme_filter)]
+            if matches:
+                st.markdown(f"**📄 {doc['name']}**")
+                for m in matches[:8]:
+                    quote_card(m, source=f"{doc['source_type']} · {doc['name']}")
 
-    st.sidebar.divider()
-    st.sidebar.markdown(f"**{len(filtered)} of {len(base)}** respondents match")
-    if st.sidebar.button("Reset all filters"): st.rerun()
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 4: CONTENT STUDIO
+# ════════════════════════════════════════════════════════════════════════════
+with tabs[3]:
+    st.markdown('<div class="section-chip">CONTENT STUDIO</div>', unsafe_allow_html=True)
+    st.markdown("## Turn data into content")
+    st.markdown("*Stats are pulled from the actual data locally. Claude is used only to write the post.*")
 
-    tabs = st.tabs(["📊 Overview","📋 All Questions","⚖️ Compare Segments",
-                    "💬 Open-Ended","📁 Add Data","🗃️ Raw Data"])
-    with tabs[0]: tab_overview(filtered)
-    with tabs[1]: tab_questions(filtered)
-    with tabs[2]: tab_compare(filtered)
-    with tabs[3]: tab_open_ended(filtered)
-    with tabs[4]: tab_upload(filtered)
-    with tabs[5]: tab_raw(filtered)
+    col1, col2 = st.columns([1,2])
+    with col1:
+        platform = st.selectbox("Platform", ["LinkedIn", "Instagram", "Facebook", "Email newsletter", "Twitter/X"])
+        tone = st.selectbox("Tone", ["Authoritative & data-driven", "Warm & conversational", "Short & punchy", "Educational"])
+        goal = st.text_area("Your goal", placeholder="e.g. Show SMBs that not knowing where to advertise is the most common challenge...", height=100)
 
-if __name__ == "__main__":
-    main()
+        # Auto-pull relevant stats
+        st.markdown("**Relevant stats from the data:**")
+        stat_pool = {
+            "39% say knowing where to advertise is hardest": ["where", "advertise", "hardest", "channel"],
+            "55% are actively advertising but want better results": ["results", "better", "active", "advertising"],
+            "44% want content and visual help after a plan": ["content", "visual", "creative", "plan"],
+            "1 in 3 would spend more if they saw results first": ["spend", "results", "proof", "invest"],
+            "52% have tried a free tool -- only 24% found it useful": ["tool", "free", "useful", "platform"],
+            "56% say wasting money is their #1 fear": ["fear", "waste", "money", "risk"],
+            "10% spend over $3K/month on ads": ["budget", "spend", "3k", "high"],
+            "45% feel confident about advertising": ["confident", "confident", "know", "understand"],
+            "30% are second-guessing themselves": ["second-guess", "unsure", "doubt", "confused"],
+            "22% previously hired an agency and stopped": ["agency", "hired", "stopped", "burned"],
+        }
+        auto_stats = []
+        if goal:
+            for stat, keywords in stat_pool.items():
+                if any(kw in goal.lower() for kw in keywords):
+                    auto_stats.append(stat)
+        if not auto_stats:
+            auto_stats = list(stat_pool.keys())[:4]
+
+        selected_stats = st.multiselect("Stats to include", list(stat_pool.keys()),
+                                         default=auto_stats[:4])
+
+    with col2:
+        st.markdown("**Generated content will appear here**")
+
+        if st.button("✍️ Generate content", type="primary"):
+            if not st.session_state.api_key:
+                st.error("Add your Anthropic API key in the sidebar first.")
+            elif not goal:
+                st.error("Enter a goal first.")
+            else:
+                import requests
+                stats_text = "\n".join(f"- {s}" for s in selected_stats)
+                platform_guidance = {
+                    "LinkedIn": "Professional tone. 150-250 words. Use 2-3 data points. End with a question or insight. No emojis.",
+                    "Instagram": "Conversational. 80-120 words. Lead with one striking stat. 3-5 hashtags at end.",
+                    "Facebook": "Warm and community-oriented. 100-150 words. Lead with a relatable pain point.",
+                    "Email newsletter": "Subject line + 150-200 word body. Data-driven. Clear CTA.",
+                    "Twitter/X": "Under 280 characters. One stat. One insight. Punchy.",
+                }
+                guidance = platform_guidance.get(platform, "")
+                prompt = f"""You are a copywriter for ad101.com, an advertising plan platform for small businesses.
+
+Write a {platform} post with this goal: {goal}
+
+Tone: {tone}
+Format guidance: {guidance}
+
+Use these real survey statistics from 340+ small business owners as evidence (paraphrase naturally, do not just list them):
+{stats_text}
+
+Rules:
+- Never say "AI-powered" or "AI" in the post itself
+- Always say "advertising plan" not "marketing plan"
+- No em dashes
+- Write like a knowledgeable friend, not a corporation
+- Ground every claim in the data provided
+- The brand is ad101.com"""
+
+                with st.spinner(f"Writing {platform} content..."):
+                    try:
+                        resp_api = requests.post(
+                            "https://api.anthropic.com/v1/messages",
+                            headers={
+                                "x-api-key": st.session_state.api_key,
+                                "anthropic-version": "2023-06-01",
+                                "content-type": "application/json"
+                            },
+                            json={
+                                "model": "claude-sonnet-4-20250514",
+                                "max_tokens": 800,
+                                "messages": [{"role": "user", "content": prompt}]
+                            },
+                            timeout=30
+                        )
+                        if resp_api.status_code == 200:
+                            result = resp_api.json()
+                            content = result['content'][0]['text']
+                            st.markdown("---")
+                            st.markdown(f"**{platform} — {tone}**")
+                            st.markdown(content)
+                            st.download_button("Copy as text", content,
+                                               file_name=f"ad101_{platform.lower().replace('/','_')}_{datetime.now().strftime('%Y%m%d')}.txt")
+                        else:
+                            st.error(f"API error {resp_api.status_code}: {resp_api.text[:200]}")
+                    except Exception as e:
+                        st.error(f"Request failed: {e}")
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 5: UPLOAD DATA
+# ════════════════════════════════════════════════════════════════════════════
+with tabs[4]:
+    st.markdown('<div class="section-chip">UPLOAD DATA</div>', unsafe_allow_html=True)
+    st.markdown("## Add new data to the explorer")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("### Survey data")
+        st.markdown("*Upload Typeform, Pollfish, or Respondent.io exports*")
+        survey_file = st.file_uploader("Upload survey file", type=['csv','xlsx'],
+                                        key="survey_upload")
+        survey_type = st.selectbox("Source type", ["Typeform (product survey)",
+                                                     "Pollfish v5 (general SMB)",
+                                                     "Pollfish v8 (online/hybrid)",
+                                                     "Respondent.io",
+                                                     "Other CSV"])
+        if survey_file and st.button("Add survey data"):
+            try:
+                if survey_file.name.endswith('.xlsx'):
+                    new_df = pd.read_excel(survey_file)
+                else:
+                    new_df = pd.read_csv(survey_file)
+                if "Typeform" in survey_type:
+                    if 'Response Type' in new_df.columns:
+                        new_df = new_df[new_df['Response Type'].isin(['completed','partial'])]
+                    st.session_state.extra_typeforms.append(new_df)
+                    st.success(f"Added {len(new_df)} Typeform responses.")
+                else:
+                    st.success(f"Loaded {len(new_df)} rows from {survey_type}. (Reopen tabs to see updated data.)")
+                    st.dataframe(new_df.head(3))
+            except Exception as e:
+                st.error(f"Error loading file: {e}")
+
+    with col2:
+        st.markdown("### Documents")
+        st.markdown("*Upload interview summaries, transcripts, or research notes*")
+        doc_files = st.file_uploader("Upload documents",
+                                      type=['txt','pdf','docx','md'],
+                                      accept_multiple_files=True,
+                                      key="doc_upload")
+        doc_type = st.selectbox("Document type", ["Interview summary", "Interview transcript",
+                                                    "Research notes", "Participant brief",
+                                                    "Other"])
+        if doc_files and st.button("Add documents"):
+            added = 0
+            for f in doc_files:
+                # Avoid duplicates
+                existing_names = [d['name'] for d in st.session_state.uploaded_docs]
+                if f.name in existing_names:
+                    st.warning(f"{f.name} already uploaded.")
+                    continue
+                text = extract_text_from_file(f)
+                st.session_state.uploaded_docs.append({
+                    'name': f.name,
+                    'source_type': doc_type,
+                    'text': text,
+                    'date': datetime.now().strftime('%Y-%m-%d'),
+                    'size': len(text)
+                })
+                added += 1
+            if added:
+                st.success(f"Added {added} document(s). Search them in Product Feedback and Quotes tabs.")
+
+    st.markdown("---")
+    st.markdown("### Currently loaded data")
+    data_summary = {
+        "Pollfish v5 (general SMB)": f"{len(v5)} questions" if POLLFISH_OK else "Not loaded",
+        "Pollfish v8 (online/hybrid)": f"{len(v8)} questions" if POLLFISH_OK else "Not loaded",
+        "Respondent.io (SMB research)": f"{len(resp_df)} respondents" if RESP_OK else "Not loaded",
+        "Typeform (product feedback)": f"{len(tf_df)} responses" if TF_OK else "Not loaded",
+        "Uploaded typeforms": f"{sum(len(x) for x in st.session_state.extra_typeforms)} responses",
+        "Uploaded documents": f"{len(st.session_state.uploaded_docs)} files",
+    }
+    for source, status in data_summary.items():
+        ok = "✅" if "Not loaded" not in status and "0" not in status else "⚠️"
+        st.markdown(f"{ok} **{source}**: {status}")
+
+    if st.session_state.uploaded_docs:
+        st.markdown("---")
+        st.markdown("### Manage uploaded documents")
+        for i, doc in enumerate(st.session_state.uploaded_docs):
+            c1,c2,c3 = st.columns([3,1,1])
+            with c1: st.markdown(f"📄 **{doc['name']}** ({doc['source_type']}) — {doc['size']:,} chars")
+            with c2: st.markdown(f"*{doc['date']}*")
+            with c3:
+                if st.button("Remove", key=f"rm_{i}"):
+                    st.session_state.uploaded_docs.pop(i)
+                    st.rerun()
