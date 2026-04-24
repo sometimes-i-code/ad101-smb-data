@@ -79,15 +79,25 @@ data/  (folder with all data files above)
 
 Streamlit will give you a URL. It redeploys automatically whenever you push changes to the repo.
 
-### Step 4 -- Share with the team
+### Step 4 -- Set the password (required)
 
-Share the Streamlit URL. The app is not password-protected by default. If you want to add a password, go to your app in Streamlit Cloud, open Settings, then Secrets, and add:
+The app is password-protected. Before sharing the URL, you need to set the password in Streamlit Cloud:
+
+1. Go to your app on [share.streamlit.io](https://share.streamlit.io)
+2. Click the three-dot menu next to your app and select **Settings**
+3. Click **Secrets** and add the following:
 
 ```toml
 password = "your-password-here"
 ```
 
-Then add password checking logic to `app.py` if needed.
+4. Click Save. The app restarts automatically.
+
+Anyone visiting the URL will see a password prompt before accessing anything. The password lives in Streamlit Secrets -- it is never in your code or your repo.
+
+### Step 5 -- Share with the team
+
+Share the Streamlit URL and password. Anyone with both can access the app in any browser with no install required.
 
 ---
 
